@@ -1,0 +1,20 @@
+{
+  "name": "jarvis-gateway",
+  "version": "0.3.0",
+  "description": "J.A.R.V.I.S private gateway — the thin HTTP adapter between your devices and the brain (execution, memory, alerts, multi-agent).",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0",
+    "@types/node": "^20.0.0"
+  }
+}

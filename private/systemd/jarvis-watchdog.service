@@ -1,0 +1,42 @@
+# J.A.R.V.I.S watchdog — keeps the home sidecars (audit loop, wake, vision,
+# device) alive and restarts them on failure. Runs under systemd so it
+# survives reboots and crashes.
+#
+# Install:
+#   1. cp private/systemd/jarvis-watchdog.service /etc/systemd/system/
+#   2. Edit the lines below marked CHANGE-ME for your user, paths.
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now jarvis-watchdog
+#   5. Check:  systemctl status jarvis-watchdog   journalctl -u jarvis-watchdog -f
+
+[Unit]
+Description=J.A.R.V.I.S watchdog supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# CHANGE-ME: run as your user so it can spawn sidecars that touch your files.
+User=jarvis
+Group=jarvis
+
+# CHANGE-ME: point at your gateway build and state dir.
+WorkingDirectory=/home/jarvis/jarvis
+ExecStart=/usr/bin/node /home/jarvis/jarvis/dist/watchdog-config.js
+Environment=WATCHDOG_STATE_DIR=/home/jarvis/jarvis
+Environment=WATCHDOG_INTERVAL_MS=10000
+# Faster audit catch-up (every 6h instead of daily) — optional.
+# Environment=AUDIT_INTERVAL_S=21600
+
+# Self-healing: restart the watchdog itself if it dies.
+Restart=always
+RestartSec=5
+
+# Hardening — the watchdog must be able to WRITE its state dir (heartbeat
+# files) and the sidecars' heartbeats, so grant read-write there only.
+NoNewPrivileges=true
+ProtectHome=true
+ReadWritePaths=/home/jarvis/jarvis
+
+[Install]
+WantedBy=multi-user.target
