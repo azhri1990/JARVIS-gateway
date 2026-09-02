@@ -7,6 +7,9 @@
 // model, but a deterministic advisor that is transparent and consistent.
 import type { ServerResponse } from 'node:http'
 import { skillStatus, isKnownMistake, experienceLog } from './learn.js'
+import { chunkDocument } from './chunker.js'
+import { rerank } from './rerank.js'
+import { shouldRecall } from './recallgate.js'
 
 export type Category =
   | 'technology' | 'business' | 'finance' | 'health' | 'security'
@@ -17,6 +20,7 @@ export interface AdviceRequest {
   category?: Category
   goal?: string
   constraints?: string[]
+  document?: string // optional doc to chunk + ground the advice on
 }
 
 export interface Advice {
@@ -28,6 +32,7 @@ export interface Advice {
   recommendation: string
   nextSteps: string[]
   groundedInLearning: boolean
+  groundingSection?: string
 }
 
 const KEYWORDS: Record<Category, string[]> = {
@@ -133,9 +138,37 @@ export async function advise(req: AdviceRequest): Promise<Advice> {
   const best = skills.filter((s) => s.confidence > 0.5).sort((a, b) => b.confidence - a.confidence)[0]
   if (best && !groundedInLearning) groundedInLearning = true
 
+  // When a document is supplied, chunk it (Khoj-style) and find the section
+  // that best matches the subject; ground the advice on that section.
+  let groundingSection: string | undefined
+  // Context-rot guard (isair/jarvis-inspired): skip the expensive chunk+rerank
+  // recall pass when the gate decides it would add no signal for this query.
+  const recallWanted = shouldRecall(req.subject, [{ role: 'tool', toolResult: req.document, text: req.document }])
+  if (req.document && req.document.trim() && recallWanted) {
+    const entries = chunkDocument(req.document, { markdown: true })
+    const q = req.subject.toLowerCase()
+    let bestScore = -1
+    for (const e of entries) {
+      const hay = (e.heading + ' ' + e.raw).toLowerCase()
+      const score = q.split(/\s+/).filter((w) => w.length > 2 && hay.includes(w)).length
+      if (score > bestScore) { bestScore = score; groundingSection = e.text }
+    }
+    // Khoj-style rerank: re-score the top candidates against the subject and
+    // pick the best, rather than the first lexical match.
+    const top = [...entries]
+      .map((e) => ({ e, s: e.heading + ' ' + e.raw }))
+      .sort((a, b) => (b.s.toLowerCase().split(/\s+/).filter((w) => w.length > 2 && q.includes(w)).length)
+        - (a.s.toLowerCase().split(/\s+/).filter((w) => w.length > 2 && q.includes(w)).length))
+      .slice(0, 5)
+      .map((x) => x.e.text)
+    const reranked = await rerank(req.subject, top)
+    if (reranked.length > 0 && reranked[0].score > 0) groundingSection = reranked[0].text
+    if (groundingSection) groundedInLearning = true
+  }
+
   const recommendation =
     solutions.length > 0
-      ? `Start with "${solutions[0].title}".${groundedInLearning ? ' This aligns with what has worked reliably before.' : ''}`
+      ? `Start with "${solutions[0].title}".${groundedInLearning ? ' This aligns with what has worked reliably before.' : ''}${groundingSection ? ' I found a relevant section in your document to ground this on.' : ''}`
       : 'Refine the problem statement, then re-ask.'
 
   return {
@@ -147,6 +180,7 @@ export async function advise(req: AdviceRequest): Promise<Advice> {
     recommendation,
     nextSteps: solutions[0]?.steps ?? ['Refine the problem statement.'],
     groundedInLearning,
+    groundingSection,
   }
 }
 

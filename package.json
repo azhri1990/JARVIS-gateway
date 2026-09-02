@@ -8,9 +8,12 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {},
   "devDependencies": {
     "typescript": "^5.4.0",

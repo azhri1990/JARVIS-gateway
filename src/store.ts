@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path'
 export const STATE_DIR = process.env.JARVIS_STATE_DIR || '/tmp/jarvis-state'
 export const LEARN_FILE = join(STATE_DIR, 'learn.json')
 export const AUDIT_FILE = join(STATE_DIR, 'audit.json')
+export const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 
 export async function ensureDir(): Promise<void> {
   await mkdir(STATE_DIR, { recursive: true })

@@ -7,6 +7,7 @@ export interface Config {
   BRAIN_URL: string
   OLLAMA_URL: string
   OLLAMA_MODEL: string
+  RERANK_MODEL: string
   WHISPER_URL: string
   SHARED_SECRET?: string
   SUPABASE_URL?: string
@@ -36,6 +37,7 @@ export const env: Config = {
   BRAIN_URL: process.env.BRAIN_URL ?? 'http://127.0.0.1:9000',
   OLLAMA_URL: process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434',
   OLLAMA_MODEL: process.env.OLLAMA_MODEL ?? 'qwen2.5:7b',
+  RERANK_MODEL: process.env.RERANK_MODEL ?? 'qwen2.5:3b',
   WHISPER_URL: process.env.WHISPER_URL ?? 'http://127.0.0.1:9001',
   SHARED_SECRET: process.env.SHARED_SECRET,
   SUPABASE_URL: process.env.SUPABASE_URL,
