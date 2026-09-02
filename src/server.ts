@@ -9,7 +9,7 @@ import { env } from './config.js'
 import type { Session } from './types.js'
 import { saveMemory, recallMemories, listScopes } from './memory.js'
 import { addWatch, removeWatch, listWatches, listAlerts, markAlertsRead, json as alertJson } from './alerts.js'
-import { spawnJob, listJobs, getJob, json as agentJson } from './agents.js'
+import { spawnJob, listJobs, getJob, ensureJobs, spawnDirectorJob, listRoles, json as agentJson } from './agents.js'
 import { listApps, performAction, json as appJson } from './apps.js'
 import { getWakeState, setArmed, reportWake, json as wakeJson } from './wake.js'
 import { ingestFrame, getLatestFrame, json as visionJson } from './vision.js'
@@ -17,11 +17,15 @@ import { listDevices, getDevice, setDevicePower, json as deviceJson } from './de
 import { requestApproval, listApprovals, getApproval, decide, json as consentJson } from './consent.js'
 import { reportAudit, getLatestAudit, json as auditJson } from './audit.js'
 import { transcribeClip, whisperHealth, json as voiceJson } from './voices.js'
+import { catalogue, recall, listMemory, getActiveMemoryService, json as memJson } from './memory.js'
+import { getSkills as getLoadedSkills, scanSkills, matchSkills, json as skillJson } from './skills.js'
 import { registerDevice, heartbeat, listDevices as listMesh, json as meshJson } from './mesh.js'
+import { chunkDocument, json as chunkJson } from './chunker.js'
+import { rerank, json as rerankJson } from './rerank.js'
 import { env as CONFIG } from './config.js'
 import { remediationFor } from './audit.js'
 import { scanHistory } from './audit.js'
-import { recordExperience, skillStatus, experienceLog, isKnownMistake, mistakeLedger, lessonMemory, synthesizeSkills, json as learnJson } from './learn.js'
+import { recordExperience, skillStatus, experienceLog, isKnownMistake, mistakeLedger, lessonMemory, synthesizeSkills, consolidateMemory, json as learnJson } from './learn.js'
 import { checkUpstream, approveUpgrade, applyUpgrade, upgradeStatus, json as upJson } from './upgrade.js'
 import { advise, json as adviceJson } from './advice.js'
 
@@ -128,6 +132,21 @@ async function handleExecute(req: IncomingMessage, res: ServerResponse, session:
 
 // --- Memory endpoints ---
 async function handleMemory(req: IncomingMessage, res: ServerResponse, method: string, pathname: string) {
+  // Frontmatter catalogue (pipali-style): derived from on-disk files, capped.
+  if (pathname === '/memory/catalogue') {
+    const svc = getActiveMemoryService()
+    return memJson(res, 200, { lines: (await svc.list()).map((e) => `${e.meta.id} (${e.meta.type}): ${e.meta.description}`), count: (await svc.list()).length, bytes: 0, capped: false, summary: await svc.catalogueSummary() })
+  }
+  if (pathname === '/memory/list') {
+    const svc = getActiveMemoryService()
+    return memJson(res, 200, { memories: await svc.list() })
+  }
+  const view = /^\/memory\/view\/([a-z0-9]+)$/.exec(pathname)
+  if (view) {
+    const svc = getActiveMemoryService()
+    const entry = await svc.recall(view[1])
+    return entry ? memJson(res, 200, { memory: entry }) : memJson(res, 404, { error: 'memory not found' })
+  }
   if (pathname === '/memory/scopes') return json(res, 200, { scopes: await listScopes() })
   if (method === 'GET') {
     const u = new URL(req.url || '', 'http://x')
@@ -232,6 +251,9 @@ async function handleLearn(req: IncomingMessage, res: ServerResponse, method: st
     void (async () => learnJson(res, 200, { skills: await synthesizeSkills() }))()
     return
   }
+  if (pathname === '/learn/consolidate' && method === 'POST') {
+    return learnJson(res, 200, { result: await consolidateMemory() })
+  }
   learnJson(res, 405, { error: 'method not allowed' })
 }
 
@@ -302,6 +324,65 @@ function handleMesh(req: IncomingMessage, res: ServerResponse, method: string, p
     return
   }
   meshJson(res, 405, { error: 'method not allowed' })
+}
+
+
+// --- Chunk (Khoj-style content chunking for the memory engine) ---
+function handleChunk(req: IncomingMessage, res: ServerResponse, method: string, pathname: string) {
+  if (pathname === '/chunk' && method === 'POST') {
+    void readBody(req).then((b) => {
+      const { document, maxTokens, markdown } = b as any
+      if (!document || typeof document !== 'string' || !document.trim())
+        return chunkJson(res, 400, { error: 'document (string) required' })
+      const entries = chunkDocument(document, { maxTokens, markdown: markdown === true })
+      return chunkJson(res, 200, { entries, count: entries.length })
+    }).catch(() => chunkJson(res, 400, { error: 'invalid body' }))
+    return
+  }
+  chunkJson(res, 405, { error: 'method not allowed' })
+}
+
+
+// --- Rerank (Khoj-style retrieve-then-rerank) ---
+async function handleRerank(req: IncomingMessage, res: ServerResponse, method: string, pathname: string) {
+  if (pathname === '/rerank' && method === 'POST') {
+    void readBody(req).then(async (b) => {
+      const { query, candidates, useModel } = b as any
+      if (!query || typeof query !== 'string' || !Array.isArray(candidates) || candidates.length === 0)
+        return rerankJson(res, 400, { error: 'query (string) and candidates (string[]) required' })
+      const result = await rerank(query, candidates.map(String), {
+        ollamaUrl: CONFIG.OLLAMA_URL,
+        model: CONFIG.RERANK_MODEL,
+      }, useModel === true)
+      return rerankJson(res, 200, { results: result })
+    }).catch(() => rerankJson(res, 400, { error: 'invalid body' }))
+    return
+  }
+  rerankJson(res, 405, { error: 'method not allowed' })
+}
+
+
+
+
+// --- Skills (SKILL.md loader: list, match, rescan) ---
+function handleSkills(req: IncomingMessage, res: ServerResponse, method: string, pathname: string) {
+  if (pathname === '/skills' && method === 'GET') {
+    void (async () => skillJson(res, 200, await getLoadedSkills()))()
+    return
+  }
+  if (pathname === '/skills/match' && method === 'POST') {
+    void readBody(req).then(async (b) => {
+      const { query } = b as any
+      if (!query || typeof query !== 'string') return skillJson(res, 400, { error: 'query required' })
+      return skillJson(res, 200, { matches: matchSkills(query) })
+    }).catch(() => skillJson(res, 400, { error: 'invalid body' }))
+    return
+  }
+  if (pathname === '/skills/rescan' && method === 'POST') {
+    void (async () => skillJson(res, 200, await scanSkills()))()
+    return
+  }
+  skillJson(res, 405, { error: 'method not allowed' })
 }
 
 function handleRemediate(req: IncomingMessage, res: ServerResponse, method: string, pathname: string) {
@@ -462,13 +543,29 @@ function handleAgents(req: IncomingMessage, res: ServerResponse, method: string,
     const job = getJob(id)
     return job ? agentJson(res, 200, { job }) : agentJson(res, 404, { error: 'job not found' })
   }
+  if (pathname === '/agents/roles' && method === 'GET') {
+    return agentJson(res, 200, { roles: listRoles() })
+  }
+  if (pathname === '/agents/director' && method === 'POST') {
+    void readBody(req).then((b) => {
+      const { objective, recovery } = b as any
+      if (!objective || typeof objective !== 'string' || !objective.trim())
+        return agentJson(res, 400, { error: 'objective required' })
+      const policy = ['retry', 'escalate', 'fallback'].includes(recovery) ? recovery : 'fallback'
+      return agentJson(res, 201, { job: spawnDirectorJob(objective, policy) })
+    }).catch(() => agentJson(res, 400, { error: 'invalid body' }))
+    return
+  }
   if (pathname === '/agents/jobs' && method === 'POST') {
     void readBody(req).then((b) => {
-      const { name, subtasks, recovery } = b as any
+      const { name, subtasks, recovery, deps, order } = b as any
       if (!name || !Array.isArray(subtasks) || subtasks.length === 0)
         return agentJson(res, 400, { error: 'name and non-empty subtasks[] required' })
       const policy = ['retry', 'escalate', 'fallback'].includes(recovery) ? recovery : 'fallback'
-      return agentJson(res, 201, { job: spawnJob(name, subtasks, policy) })
+      const depMap: Record<string, string> | undefined =
+        deps && typeof deps === 'object' ? deps : undefined
+      const ord: 'sequential' | 'parallel' = order === 'parallel' ? 'parallel' : 'sequential'
+      return agentJson(res, 201, { job: spawnJob(name, subtasks, policy, depMap, ord) })
     }).catch(() => agentJson(res, 400, { error: 'invalid body' }))
     return
   }
@@ -489,13 +586,19 @@ const server = createServer((req, res) => {
   if (!session) return json(res, 401, { error: 'unauthorized' })
   if (url === '/run' && method === 'POST') return handleRun(req, res)
   if (url === '/execute' && method === 'POST') return void handleExecute(req, res, session)
-  if (url === '/memory' || url === '/memory/scopes') return void handleMemory(req, res, method, url)
+  if (url === '/skills' || url.startsWith('/skills/'))
+    return handleSkills(req, res, method, url)
+  if (url === '/memory' || url.startsWith('/memory/')) return void handleMemory(req, res, method, url)
   if (url === '/alerts' || url === '/alerts/read' || url === '/alerts/watches' || url.startsWith('/alerts/watches/'))
     return handleAlerts(req, res, method, url)
   if (url === '/devices/register' || url === '/devices/heartbeat')
     return handleMesh(req, res, method, url)
   if (url === '/voices' || url === '/voices/transcribe' || url === '/voices/health')
     return handleVoices(req, res, method, url)
+  if (url === '/rerank')
+    return handleRerank(req, res, method, url)
+  if (url === '/chunk')
+    return handleChunk(req, res, method, url)
   if (url === '/advice')
     return handleAdvice(req, res, method, url)
   if (url === '/learn' || url.startsWith('/learn/'))
@@ -521,6 +624,18 @@ const server = createServer((req, res) => {
 
   json(res, 404, { error: 'not found' })
 })
+
+// Schedule dream memory-consolidation (pipali-style dual gate). Runs every 6h;
+// the gate inside consolidateMemory decides whether there is anything to do.
+const CONSOLIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000
+setInterval(() => {
+  void consolidateMemory().then((r) => {
+    if (r.ran) console.log(`[learn] dream consolidation: ${r.deduped} deduped, ${r.staleDropped} stale dropped`)
+  }).catch(() => {})
+}, CONSOLIDATE_INTERVAL_MS)
+
+// Durable execution: resume any jobs that were in-flight when the gateway last stopped.
+void ensureJobs().catch(() => {})
 
 server.listen(env.PORT, env.HOST, () => {
   console.log(`[jarvis] gateway on ${env.HOST}:${env.PORT} (brain=${env.BRAIN_MODE})`)

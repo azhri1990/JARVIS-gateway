@@ -9,6 +9,7 @@
 // Persisted to a JSON file so learning survives restarts.
 import type { ServerResponse } from 'node:http'
 import { LEARN_FILE, load, save } from './store.js'
+import { writeMemory } from './memory.js'
 
 export interface Experience {
   id: string
@@ -119,6 +120,12 @@ export async function recordExperience(
     // Distill a durable lesson from the failure (remember what it learns).
     lessons.push({ id: `l${lessons.length + 1}`, skill, text: `Avoid ${detail || skill} in "${context}" — it failed.`, kind: 'lesson', at })
     if (lessons.length > 200) lessons = lessons.slice(-200)
+    // Emit a frontmatter memory file (pipali-style) so it's retrievable + catalogued.
+    const last = lessons[lessons.length - 1]
+    void writeMemory(
+      { id: last.id, type: 'lesson', description: last.text, skill: last.skill, at: last.at },
+      last.text
+    ).catch(() => {})
   }
 
   rebuild()
@@ -192,6 +199,88 @@ export async function rankApproaches(skill: string, candidates: string[]): Promi
   if (!rec || rec.total === 0) return candidates // no prior learning — keep order
   // Sort by how many times each candidate succeeded (context match heuristic).
   return [...candidates]
+}
+
+// --- Dream consolidation (pipali-inspired) ---
+// A periodic pass that dedupes repeated lessons, discards stale ones, and
+// merges repeated failures into a single consolidated lesson. Gated on BOTH
+// elapsed time AND new volume, so a quiet period with nothing to consolidate
+// doesn't fire. Returns a summary of what was changed.
+export interface DreamResult {
+  ran: boolean
+  reason: 'skipped-time' | 'skipped-volume' | 'done'
+  lessonsBefore: number
+  lessonsAfter: number
+  deduped: number
+  staleDropped: number
+  at: string
+}
+
+const DREAM_MIN_INTERVAL_MS = 12 * 60 * 60 * 1000 // 12h
+const DREAM_MIN_NEW = 5 // at least 5 new experiences since last dream
+
+let lastDreamAt = 0
+
+export async function consolidateMemory(now = Date.now()): Promise<DreamResult> {
+  await ensureLoaded()
+  const since = lastDreamAt || now
+  const elapsedOk = now - since >= DREAM_MIN_INTERVAL_MS
+  const newCount = experiences.filter((e) => new Date(e.at).getTime() >= since).length
+  if (!elapsedOk) return { ran: false, reason: 'skipped-time', lessonsBefore: lessons.length, lessonsAfter: lessons.length, deduped: 0, staleDropped: 0, at: new Date().toISOString() }
+  if (newCount < DREAM_MIN_NEW) return { ran: false, reason: 'skipped-volume', lessonsBefore: lessons.length, lessonsAfter: lessons.length, deduped: 0, staleDropped: 0, at: new Date().toISOString() }
+
+  // 1) Dedupe lessons that say the same thing about the same skill.
+  const seen = new Map<string, Lesson>()
+  let deduped = 0
+  for (const l of lessons) {
+    const key = `${l.skill}::${l.text}`
+    if (seen.has(key)) deduped++
+    else seen.set(key, l)
+  }
+  lessons = [...seen.values()]
+
+  // 2) Merge repeated failures for the same (skill, context) into one lesson.
+  const failByKey = new Map<string, { skill: string; text: string; kind: 'lesson' }>()
+  let merged = 0
+  for (const e of experiences) {
+    if (e.outcome !== 'failure') continue
+    const key = `${e.skill}::${e.context}`
+    if (failByKey.has(key)) {
+      merged++
+    } else {
+      failByKey.set(key, { skill: e.skill, text: `Avoid ${e.detail || e.skill} in "${e.context}" \u2014 it failed.`, kind: 'lesson' })
+    }
+  }
+  // Remove duplicate single-occurrence failure lessons that were already merged.
+  const failureTexts = new Set([...failByKey.values()].map((l) => l.text))
+  const before = lessons.length
+  lessons = lessons.filter((l) => !failureTexts.has(l.text) || [...lessons].filter((x) => x.text === l.text).length === 1)
+  // Re-add a single consolidated lesson per repeated-failure group.
+  for (const l of failByKey.values()) {
+    if (!lessons.some((x) => x.text === l.text)) {
+      lessons.push({ id: `l${lessons.length + 1}`, skill: l.skill, text: l.text, kind: l.kind, at: new Date().toISOString() })
+    }
+  }
+  const staleDropped = before - lessons.length
+
+  // 3) Drop stale lessons older than 90 days with no recent reinforcement.
+  const cutoff = now - 90 * 24 * 60 * 60 * 1000
+  const recentSkills = new Set(experiences.filter((e) => new Date(e.at).getTime() >= cutoff).map((e) => e.skill))
+  const beforeStale = lessons.length
+  lessons = lessons.filter((l) => new Date(l.at).getTime() >= cutoff || recentSkills.has(l.skill))
+  const staleDrop2 = beforeStale - lessons.length
+
+  lastDreamAt = now
+  await persist()
+  return {
+    ran: true,
+    reason: 'done',
+    lessonsBefore: before,
+    lessonsAfter: lessons.length,
+    deduped,
+    staleDropped: staleDropped + staleDrop2,
+    at: new Date().toISOString(),
+  }
 }
 
 export function json(res: ServerResponse, code: number, body: unknown): void {
