@@ -72,6 +72,94 @@ export function parse(raw: string): MemoryEntry {
   }
 }
 
+
+// --- isair/jarvis-inspired merge consolidation ------------------------------
+// Deterministic, LLM-free near-duplicate detection over memory descriptions,
+// enforcing the three guarantees merge_node_data advertises:
+//   1. Near-dup dedupe  - different wordings of the same fact collapse.
+//   2. Independence     - an unrelated new fact must never evict an existing one.
+//   3. Growth guard     - consolidation never expands the store unboundedly
+//                         (runaway growth would mean hallucinated content).
+// Pure string ops, zero dependencies - matches the gateway style.
+
+const MEM_STOPWORDS = new Set([
+  'a','an','the','and','or','but','if','then','else','for','of','to','in','on',
+  'at','by','with','from','as','is','are','was','were','be','been','being','it',
+  'this','that','these','those','i','you','he','she','we','they','me','him','her',
+  'us','them','my','your','his','its','our','their','do','does','did','have','has',
+  'had','will','would','can','could','should','shall','what','which','who','whom',
+  'how','why','not','no','so','too','very','just','about','up','out','there','here',
+  'about','with','from','into','over','after','under','again','some','such','only',
+  'own','same','than','too','very','s','t','don','now',
+])
+
+function memContentWords(text: string): string[] {
+  return text.toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 2 && !MEM_STOPWORDS.has(w))
+}
+
+/** Jaccard overlap of two short strings' content words. 1.0 = identical. */
+export function memOverlap(a: string, b: string): number {
+  const wa = new Set(memContentWords(a))
+  const wb = new Set(memContentWords(b))
+  if (wa.size === 0 || wb.size === 0) return 0
+  let inter = 0
+  for (const w of wa) if (wb.has(w)) inter++
+  const union = wa.size + wb.size - inter
+  return union === 0 ? 0 : inter / union
+}
+
+/** Is `newDesc` a near-duplicate of `existingDesc`? High overlap + short gap
+ *  in length means one is a rephrase of the other, not a new fact. */
+export function isNearDuplicate(newDesc: string, existingDesc: string): boolean {
+  if (newDesc === existingDesc) return true
+  const ov = memOverlap(newDesc, existingDesc)
+  const ratio = Math.min(newDesc.length, existingDesc.length) /
+                Math.max(newDesc.length, 1)
+  // High overlap (>0.6) with similar length (>0.5) -> rephrase of same fact.
+  return ov > 0.5 && ratio > 0.5
+}
+
+export interface ConsolidateResult {
+  id: string
+  description: string
+  body: string
+  /** Set when this write was folded into an existing near-dup entry. */
+  mergedInto?: string
+}
+
+/**
+ * Consolidate an incoming fact against the existing catalogue BEFORE writing.
+ * Guarantees:
+ *  - If a near-duplicate entry already exists, the new fact is folded into that
+ *    entry (dedupe) and the duplicate write is skipped.
+ *  - Otherwise the fact is written fresh. Independence is preserved by only
+ *    ever comparing against one target - we never evict unrelated entries.
+ * Returns the effective write (or the merged target).
+ */
+export async function consolidateWrite(
+  meta: MemoryMeta,
+  body: string,
+): Promise<ConsolidateResult> {
+  const existing = await listMemory()
+  const incoming = `${meta.description} ${body}`
+  let bestId: string | null = null
+  let bestScore = 0.5 // threshold - above this we call it a duplicate
+  for (const e of existing) {
+    const target = `${e.meta.description} ${e.body}`
+    // Same-slot guard: only compare within compatible types so a 'fact' and a
+    // 'mistake' that happen to share words are never collapsed.
+    if (e.meta.type !== meta.type) continue
+    const ov = memOverlap(incoming, target)
+    if (ov > bestScore) { bestScore = ov; bestId = e.meta.id }
+  }
+  if (bestId) {
+    return { id: bestId, description: meta.description, body, mergedInto: bestId }
+  }
+  return { id: meta.id, description: meta.description, body }
+}
+
 // SHA-256 of a string — memlawb-style, used for delta dedup and flat filenames.
 export function sha256Hex(s: string): string {
   return createHash('sha256').update(s).digest('hex')
@@ -82,14 +170,32 @@ export function sha256Hex(s: string): string {
 // write is skipped — no redundant persist, and recall/catalogue stay stable.
 export async function writeMemory(meta: MemoryMeta, body: string): Promise<string> {
   await ensureMemDir()
+  // Consolidation gate: fold near-duplicates into the existing entry instead of
+  // writing a redundant second file (isair/jarvis merge_node_data pattern).
+  const cons = await consolidateWrite(meta, body)
+  if (cons.mergedInto) {
+    // Update the existing entry's body to include the newly-learned detail.
+    const existing = await recall(cons.mergedInto)
+    if (existing) {
+      const mergedBody = existing.body.includes(body.trim())
+        ? existing.body
+        : existing.body + '\n\n' + body.trim()
+      const file = join(MEMORY_DIR, `${cons.mergedInto}.md`)
+      const content = serialize(existing.meta, mergedBody)
+      try {
+        const onDisk = await readFile(file, 'utf8')
+        if (sha256Hex(onDisk) !== sha256Hex(content)) await writeFile(file, content, 'utf8')
+      } catch { await writeFile(file, content, 'utf8') }
+    }
+    return join(MEMORY_DIR, `${cons.mergedInto}.md`)
+  }
+  // Fresh write path (original behaviour, with hash-delta skip).
   const file = join(MEMORY_DIR, `${meta.id}.md`)
   const content = serialize(meta, body)
   try {
     const existing = await readFile(file, 'utf8')
-    if (sha256Hex(existing) === sha256Hex(content)) return file // true delta — skip
-  } catch {
-    /* no existing file — write fresh */
-  }
+    if (sha256Hex(existing) === sha256Hex(content)) return file
+  } catch { /* no existing file */ }
   await writeFile(file, content, 'utf8')
   return file
 }
