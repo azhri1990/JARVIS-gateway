@@ -619,7 +619,7 @@ const server = createServer((req, res) => {
     return handleWake(req, res, method, url)
   if (url === '/apps' || url === '/apps/act')
     return handleApps(req, res, method, url)
-  if (url === '/agents/jobs' || url.startsWith('/agents/jobs/'))
+  if (url === '/agents/jobs' || url.startsWith('/agents/jobs/') || url === '/agents/director' || url === '/agents/roles')
     return handleAgents(req, res, method, url)
 
   json(res, 404, { error: 'not found' })

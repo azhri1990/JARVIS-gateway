@@ -134,3 +134,81 @@ test('agents: listRoles is consistent with ROLES', () => {
   const names = roles.map((r) => r.role)
   assert.deepEqual(names, ['code', 'research', 'memory', 'voice', 'general'])
 })
+import { detectVoice, feedFrame, registerWakeEngine, setWakeEngine, getWakeState, makeRustpotterEngine } from '../src/wake.js'
+
+// --- wake: pluggable engine + VAD gate (ported from Priler/jarvis) ---
+test('wake: energy VAD flags loud frames as voice, quiet as silence', () => {
+  assert.equal(detectVoice(new Int16Array(1600)).isVoice, false) // all zeros
+  const loud = new Int16Array(1600).fill(800)
+  const v = detectVoice(loud)
+  assert.equal(v.isVoice, true)
+  assert.ok(v.confidence > 0 && v.confidence <= 1)
+})
+
+test('wake: feedFrame gates on VAD and only fires active engine above min score', () => {
+  // register a test engine that always reports a strong hit
+  let called = 0
+  registerWakeEngine('test-engine' as any, { processFrame: () => { called++; return { score: 0.99 } } })
+  setWakeEngine('test-engine' as any)
+  // silence: VAD rejects, engine not called
+  feedFrame(new Int16Array(1600))
+  assert.equal(called, 0)
+  // loud: VAD passes, engine fires => wake reported (lastWake set)
+  const loud = new Int16Array(1600).fill(900)
+  const woke = feedFrame(loud)
+  assert.equal(woke, true)
+  assert.equal(called, 1)
+  assert.ok(getWakeState().lastWake, 'lastWake set on wake')
+  // engineActive now true after registering a non-tap engine
+  assert.equal(getWakeState().engineActive, true)
+})
+
+test('wake: makeRustpotterEngine maps native detection onto processFrame', () => {
+  let received: number[] = []
+  const eng = makeRustpotterEngine((frame) => { received = frame; return 0.7 })
+  const hit = eng.processFrame([100, 200, 300])
+  assert.ok(hit && hit.score === 0.7)
+  assert.deepEqual(received, [100, 200, 300])
+  // native returning null => no detection
+  const eng2 = makeRustpotterEngine(() => null)
+  assert.equal(eng2.processFrame([1, 2, 3]), null)
+})
+import { isNearDuplicate, memOverlap, consolidateWrite, writeMemory } from '../src/memory.js'
+
+// --- memory: merge-consolidation guard (isair/jarvis merge_node_data port) ---
+test('memory: near-dup dedupe collapses near-exact rephrased facts', () => {
+  assert.equal(isNearDuplicate('The user lives in London.', 'The user lives in London now.'), true)
+  assert.equal(isNearDuplicate('Gateway runs on Node 22', 'The gateway runs on Node 22.'), true)
+})
+
+test('memory: unrelated facts are NOT treated as duplicates (independence)', () => {
+  assert.equal(isNearDuplicate('The user lives in London.', 'The gateway runs on Node 22.'), false)
+})
+
+test('memory: identical facts always dedupe', () => {
+  assert.equal(isNearDuplicate('Likes sushi on Thursdays', 'Likes sushi on Thursdays'), true)
+})
+
+test('memory: consolidateWrite folds a same-type near-dup, keeps unrelated and different-type', async () => {
+  // isolate to a temp state dir so consolidation sees real disk state
+  const before = process.env.JARVIS_STATE_DIR
+  process.env.JARVIS_STATE_DIR = '/tmp/jv-mem-test-' + Date.now()
+  try {
+    const at = new Date().toISOString()
+    // seed via writeMemory (persists to the temp dir)
+    await writeMemory({ id: 'f-london', type: 'fact', description: 'User lives in London.', at }, 'London based.')
+    // rephrased, sharing content words -> must fold into f-london
+    const dup = await consolidateWrite({ id: 'f-london2', type: 'fact', description: 'User lives in London now.', at }, 'Based in London.')
+    assert.equal(dup.mergedInto, 'f-london')
+    // unrelated content -> fresh write, never folded into f-london
+    const other = await consolidateWrite({ id: 'f-node', type: 'fact', description: 'Gateway runs on Node 22.', at }, 'runtime pin')
+    assert.notEqual(other.mergedInto, 'f-london')
+    // different type, even with overlapping wording -> never collapsed
+    const mistake = await consolidateWrite({ id: 'm-london', type: 'mistake', description: 'User lives in London.', at }, 'x')
+    assert.notEqual(mistake.mergedInto, 'f-london')
+  } finally {
+    process.env.JARVIS_STATE_DIR = before
+  }
+})
+
+
